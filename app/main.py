@@ -1854,7 +1854,9 @@ def explain_endpoint(
             verbosity="executionStats",
         )
 
+    
 
+    
 
     else:  # department_trend
         if not department:
@@ -1889,23 +1891,240 @@ def explain_endpoint(
         collection = "attendance_logs"
 
         # Explain the indexed date-range query used by the trend.
+        
+        start_dt = datetime.combine(start, datetime.min.time())
+        end_exclusive = datetime.combine(
+            end + timedelta(days=1),
+            datetime.min.time(),
+        )
+
+        # Build the same aggregation used by department_trend.
+        pipeline = [
+            {"$documents": [{"date": start_dt}]},
+            {
+                "$densify": {
+                    "field": "date",
+                    "range": {
+                        "step": 1,
+                        "unit": "day",
+                        "bounds": [start_dt, end_exclusive],
+                    },
+                }
+            },
+            {
+                "$set": {
+                    "date_str": {
+                        "$dateToString": {
+                            "format": "%Y-%m-%d",
+                            "date": "$date",
+                            "timezone": "UTC",
+                        }
+                    }
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "attendance_logs",
+                    "let": {"day": "$date_str"},
+                    "pipeline": [
+                        {
+                            "$match": {
+                                "$expr": {"$eq": ["$date", "$$day"]}
+                            }
+                        },
+                        {
+                            "$lookup": {
+                                "from": "employees",
+                                "localField": "emp_code",
+                                "foreignField": "emp_code",
+                                "as": "employee",
+                            }
+                        },
+                        {"$unwind": "$employee"},
+                        {"$match": {"employee.department": department}},
+                        {
+                            "$group": {
+                                "_id": None,
+                                "present_count": {
+                                    "$sum": {
+                                        "$cond": [
+                                            {
+                                                "$in": [
+                                                    "$status",
+                                                    ["PRESENT", "WFH", "ON_DUTY"],
+                                                ]
+                                            },
+                                            {
+                                                "$cond": [
+                                                    {"$eq": ["$half_day", True]},
+                                                    0.5,
+                                                    1,
+                                                ]
+                                            },
+                                            0,
+                                        ]
+                                    }
+                                },
+                                "late_count": {
+                                    "$sum": {
+                                        "$cond": [
+                                            {"$gt": ["$late_minutes", 0]},
+                                            1,
+                                            0,
+                                        ]
+                                    }
+                                },
+                            }
+                        },
+                    ],
+                    "as": "daily",
+                }
+            },
+            {
+                "$set": {
+                    "present_count": {
+                        "$ifNull": [
+                            {"$arrayElemAt": ["$daily.present_count", 0]},
+                            0,
+                        ]
+                    },
+                    "late_count": {
+                        "$ifNull": [
+                            {"$arrayElemAt": ["$daily.late_count", 0]},
+                            0,
+                        ]
+                    },
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "employees",
+                    "let": {"day": "$date_str"},
+                    "pipeline": [
+                        {
+                            "$match": {
+                                "$expr": {
+                                    "$and": [
+                                        {"$eq": ["$department", department]},
+                                        {"$lte": ["$joined_on", "$$day"]},
+                                    ]
+                                }
+                            }
+                        },
+                        {"$count": "count"},
+                    ],
+                    "as": "headcount_result",
+                }
+            },
+            {
+                "$set": {
+                    "headcount": {
+                        "$ifNull": [
+                            {
+                                "$arrayElemAt": [
+                                    "$headcount_result.count",
+                                    0,
+                                ]
+                            },
+                            0,
+                        ]
+                    },
+                    "weekday": {"$dayOfWeek": "$date"},
+                }
+            },
+            {
+                "$set": {
+                    "is_working_day": {
+                        "$in": ["$weekday", [2, 3, 4, 5, 6]]
+                    }
+                }
+            },
+            {
+                "$set": {
+                    "attendance_rate": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$is_working_day",
+                                    {"$gt": ["$headcount", 0]},
+                                ]
+                            },
+                            {"$divide": ["$present_count", "$headcount"]},
+                            None,
+                        ]
+                    }
+                }
+            },
+            {
+                "$setWindowFields": {
+                    "sortBy": {"date": 1},
+                    "output": {
+                        "moving_avg_7d": {
+                            "$avg": "$attendance_rate",
+                            "window": {"documents": [-6, 0]},
+                        }
+                    },
+                }
+            },
+            {
+                "$project": {
+                    "_id": 0,
+                    "date": "$date_str",
+                    "is_working_day": 1,
+                    "headcount": 1,
+                    "present_count": 1,
+                    "late_count": 1,
+                    "attendance_rate": 1,
+                    "moving_avg_7d": 1,
+                }
+            },
+            {"$sort": {"date": 1}},
+        ]
+
+        # $documents starts a collectionless aggregation.
+        
+        collection = "attendance_logs"
+
         explain = db.command(
             "explain",
             {
-                "find": collection,
-                "filter": {
-                    "date": {
-                        "$gte": start.isoformat(),
-                        "$lte": end.isoformat(),
-                    }
-                },
-                "sort": {
-                    "date": -1,
-                    "emp_code": 1,
-                },
+                "aggregate": "attendance_logs",
+                "pipeline": [
+                    {
+                        "$match": {
+                            "date": {
+                                "$gte": start.isoformat(),
+                                "$lte": end.isoformat(),
+                            }
+                        }
+                    },
+                    {
+                        "$lookup": {
+                            "from": "employees",
+                            "localField": "emp_code",
+                            "foreignField": "emp_code",
+                            "as": "employee",
+                        }
+                    },
+                    {"$unwind": "$employee"},
+                    {
+                        "$match": {
+                            "employee.department": department
+                        }
+                    },
+                    {
+                        "$sort": {
+                            "date": 1,
+                            "emp_code": 1,
+                        }
+                    },
+                ],
+                "cursor": {},
             },
             verbosity="executionStats",
         )
+
+
 
     return {
         "endpoint": endpoint,
